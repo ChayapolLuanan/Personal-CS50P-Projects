@@ -1,0 +1,246 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>DNA → Protein Interactive Simulator</title>
+  <style>
+    body { background:#0b1220; color:#e6edf7; font-family:sans-serif; margin:0; }
+    header { padding:1rem; border-bottom:1px solid #203151; }
+    main { display:grid; grid-template-columns: 400px 1fr; gap:1rem; padding:1rem; }
+    textarea, select { width:100%; background:#0b1426; color:#fff; border:1px solid #203151; border-radius:6px; padding:0.5rem; font-family:monospace; }
+    .out { background:#0b1426; border:1px dashed #203151; border-radius:6px; padding:0.5rem; font-family:monospace; white-space:pre-wrap; }
+    button { background:#7cc5ff; color:#041120; border:none; border-radius:6px; padding:0.5rem 1rem; cursor:pointer; margin-top:0.5rem; }
+    .dna-span { cursor:pointer; padding:0 2px; }
+    .dna-span:hover { background:#203151; border-radius:4px; }
+    #viewer { width:100%; height:560px; background:#0b1426; border:1px solid #203151; border-radius:10px; }
+    .info { background:#0b1426; border:1px solid #203151; border-radius:10px; padding:0.5rem; font-family:monospace; }
+  </style>
+</head>
+<body>
+  <header><h1>DNA → Protein Interactive Simulator</h1></header>
+  <main>
+    <section>
+      <label>DNA Sequence (click bases to mutate)</label>
+      <div id="dnaDisplay" class="out"></div>
+      <label for="frame">Reading Frame</label>
+      <select id="frame">
+        <option value="auto">Auto (from first AUG)</option>
+        <option value="0">Frame 1</option>
+        <option value="1">Frame 2</option>
+        <option value="2">Frame 3</option>
+      </select>
+      <label for="stop">Stop at stop codon?</label>
+      <select id="stop">
+        <option value="true">Yes</option>
+        <option value="false">No</option>
+      </select>
+      <button id="sample">Load Sample</button>
+    </section>
+    <section>
+      <h3>mRNA</h3>
+      <div id="mrnaOut" class="out">—</div>
+      <h3>Protein</h3>
+      <div id="aaOut" class="out">—</div>
+      <h3>3D Peptide (click a residue)</h3>
+      <div id="viewer"></div>
+      <div class="info" id="resInfo">Click a sphere to see residue details…</div>
+    </section>
+  </main>
+
+  <!-- Three.js + CSS2DRenderer for labels -->
+  <script src="https://unpkg.com/three@0.161.0/build/three.min.js"></script>
+  <script src="https://unpkg.com/three@0.161.0/examples/jsm/renderers/CSS2DRenderer.js"></script>
+  <script>
+    const dnaDisplay = document.getElementById('dnaDisplay');
+    const mrnaOut = document.getElementById('mrnaOut');
+    const aaOut = document.getElementById('aaOut');
+    const frameEl = document.getElementById('frame');
+    const stopEl = document.getElementById('stop');
+    const resInfo = document.getElementById('resInfo');
+    let dnaSeq = "";
+
+    const CODON_TABLE = {
+      UUU:'F', UUC:'F', UUA:'L', UUG:'L', CUU:'L', CUC:'L', CUA:'L', CUG:'L', AUU:'I', AUC:'I', AUA:'I', AUG:'M',
+      GUU:'V', GUC:'V', GUA:'V', GUG:'V', UCU:'S', UCC:'S', UCA:'S', UCG:'S', CCU:'P', CCC:'P', CCA:'P', CCG:'P',
+      ACU:'T', ACC:'T', ACA:'T', ACG:'T', GCU:'A', GCC:'A', GCA:'A', GCG:'A', UAU:'Y', UAC:'Y', UAA:'*', UAG:'*',
+      CAU:'H', CAC:'H', CAA:'Q', CAG:'Q', AAU:'N', AAC:'N', AAA:'K', AAG:'K', GAU:'D', GAC:'D', GAA:'E', GAG:'E',
+      UGU:'C', UGC:'C', UGA:'*', UGG:'W', CGU:'R', CGC:'R', CGA:'R', CGG:'R', AGU:'S', AGC:'S', AGA:'R', AGG:'R',
+      GGU:'G', GGC:'G', GGA:'G', GGG:'G'
+    };
+    const AA_NAMES = { A:'Alanine', C:'Cysteine', D:'Aspartate', E:'Glutamate', F:'Phenylalanine', G:'Glycine',
+      H:'Histidine', I:'Isoleucine', K:'Lysine', L:'Leucine', M:'Methionine', N:'Asparagine', P:'Proline', Q:'Glutamine',
+      R:'Arginine', S:'Serine', T:'Threonine', V:'Valine', W:'Tryptophan', Y:'Tyrosine', '*':'Stop', '?':'Unknown' };
+
+    function aaProp(code){
+      const hydrophobic = 'AILMVFWY';
+      const polar = 'STNQ';
+      const positive = 'KRH';
+      const negative = 'DE';
+      if(hydrophobic.includes(code)) return 'hydrophobic';
+      if(polar.includes(code)) return 'polar';
+      if(positive.includes(code)) return 'positive (basic)';
+      if(negative.includes(code)) return 'negative (acidic)';
+      if(code==='G') return 'small';
+      return 'other';
+    }
+
+    function renderDNA(){
+      dnaDisplay.innerHTML = '';
+      dnaSeq.split('').forEach((base,i) => {
+        const span = document.createElement('span');
+        span.textContent = base;
+        span.className = 'dna-span';
+        span.addEventListener('click', () => {
+          dnaSeq = mutateBase(dnaSeq, i);
+          updateOutputs();
+        });
+        dnaDisplay.appendChild(span);
+      });
+    }
+    function mutateBase(seq, index){
+      const bases = ['A','T','C','G'];
+      const current = seq[index];
+      const idx = bases.indexOf(current);
+      return seq.substring(0,index) + bases[(idx+1)%4] + seq.substring(index+1);
+    }
+    function transcribe(dna){ return dna.replace(/T/g,'U'); }
+    function translate(mrna, frameMode, stopAtStop){
+      let startIndex = 0;
+      if(frameMode==='auto'){
+        const idx = mrna.indexOf('AUG');
+        startIndex = idx >=0 ? idx : 0;
+      } else {
+        startIndex = parseInt(frameMode,10)||0;
+      }
+      let aa = [];
+      for(let i=startIndex;i+2<mrna.length;i+=3){
+        const codon = mrna.slice(i,i+3);
+        const a = CODON_TABLE[codon]||'?';
+        if(a==='*' && stopAtStop) break;
+        aa.push(a);
+      }
+      return aa.join('');
+    }
+
+    // ==== 3D Rendering ====
+    let scene, camera, renderer, labelRenderer, group, raycaster = new THREE.Raycaster(), mouse = new THREE.Vector2();
+    function init3D(){
+      const el = document.getElementById('viewer');
+      scene = new THREE.Scene();
+      camera = new THREE.PerspectiveCamera(55, el.clientWidth/el.clientHeight, 0.1, 1000);
+      camera.position.set(0,1.2,7);
+      renderer = new THREE.WebGLRenderer({antialias:true});
+      renderer.setSize(el.clientWidth, el.clientHeight);
+      labelRenderer = new THREE.CSS2DRenderer();
+      labelRenderer.setSize(el.clientWidth, el.clientHeight);
+      labelRenderer.domElement.style.position = 'absolute';
+      labelRenderer.domElement.style.top = '0';
+      el.innerHTML = '';
+      el.appendChild(renderer.domElement);
+      el.appendChild(labelRenderer.domElement);
+      scene.add(new THREE.AmbientLight(0x888888));
+      const dir = new THREE.DirectionalLight(0xffffff, 1.0); dir.position.set(3,5,4); scene.add(dir);
+      window.addEventListener('resize', ()=>{
+        renderer.setSize(el.clientWidth, el.clientHeight);
+        labelRenderer.setSize(el.clientWidth, el.clientHeight);
+        camera.aspect = el.clientWidth/el.clientHeight; camera.updateProjectionMatrix();
+      });
+      renderer.domElement.addEventListener('click', on3DClick);
+      animate();
+    }
+    function animate(){
+      requestAnimationFrame(animate);
+      if(group){ group.rotation.y += 0.002; }
+      renderer.render(scene, camera);
+      labelRenderer.render(scene, camera);
+    }
+    function clear3D(){ if(group){ scene.remove(group); group=null; } }
+    function aaColor(code){
+      const hydrophobic = 'AILMVFWY';
+      const polar = 'STNQ';
+      const positive = 'KRH';
+      const negative = 'DE';
+      if(hydrophobic.includes(code)) return 0x4fc3f7;
+      if(polar.includes(code)) return 0xa3e635;
+      if(positive.includes(code)) return 0xf59e0b;
+      if(negative.includes(code)) return 0xef4444;
+      if(code==='G') return 0xffffff; return 0xcccccc;
+    }
+    function addLabel(text, pos, color){
+      const div = document.createElement('div');
+      div.style.color = color; div.style.fontSize='12px'; div.textContent = text;
+      const label = new THREE.CSS2DObject(div);
+      label.position.copy(pos.clone().add(new THREE.Vector3(0,0.3,0)));
+      group.add(label);
+    }
+    function renderPeptide(seq){
+      if(!scene) init3D();
+      clear3D();
+      group = new THREE.Group();
+      const sphereGeo = new THREE.SphereGeometry(0.18, 24, 24);
+      const cylGeo = new THREE.CylinderGeometry(0.06, 0.06, 0.5, 16);
+      const step = 0.6, turn = Math.PI/3;
+      let prevPos = null;
+      for(let i=0;i<seq.length;i++){
+        const aa = seq[i];
+        const angle = i*turn;
+        const x=Math.cos(angle)*1.2, y=(i - seq.length/2)*(step*0.35), z=Math.sin(angle)*1.2;
+        const mat = new THREE.MeshPhongMaterial({ color: aaColor(aa) });
+        const sphere = new THREE.Mesh(sphereGeo, mat);
+        sphere.position.set(x,y,z);
+        sphere.userData = { index:i, aa };
+        group.add(sphere);
+        if(prevPos){
+          const start = prevPos.clone(); const end = sphere.position.clone();
+          const mid = new THREE.Vector3().addVectors(start,end).multiplyScalar(0.5);
+          const dir = new THREE.Vector3().subVectors(end,start); const len = dir.length();
+          const bond = new THREE.Mesh(cylGeo, new THREE.MeshPhongMaterial({ color:0x9fb0c3 }));
+          bond.scale.set(1, len/0.5, 1); bond.position.copy(mid);
+          bond.quaternion.setFromUnitVectors(new THREE.Vector3(0,1,0), dir.clone().normalize());
+          group.add(bond);
+        }
+        prevPos = sphere.position.clone();
+      }
+      // === Annotations ===
+      const mrna = transcribe(dnaSeq);
+      const aaSeq = translate(mrna, frameEl.value, stopEl.value==='true');
+      const startIndex = aaSeq.indexOf('M');
+      if(startIndex >= 0 && group.children[startIndex]) addLabel('Start', group.children[startIndex].position, 'lime');
+      const stopIndex = aaSeq.indexOf('*');
+      if(stopIndex >= 0 && group.children[stopIndex]) addLabel('Stop', group.children[stopIndex].position, 'red');
+      scene.add(group);
+    }
+    function on3DClick(event){
+      const rect = renderer.domElement.getBoundingClientRect();
+      mouse.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+      mouse.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+      raycaster.setFromCamera(mouse, camera);
+      const spheres = group ? group.children.filter(o=>o.geometry && o.geometry.type==='SphereGeometry') : [];
+      const intersects = raycaster.intersectObjects(spheres);
+      if(intersects.length){
+        const mesh = intersects[0].object;
+        const { index, aa } = mesh.userData;
+        mesh.scale.set(1.35,1.35,1.35); setTimeout(()=>mesh.scale.set(1,1,1), 250);
+        resInfo.textContent = `Residue ${index+1}: ${aa} — ${AA_NAMES[aa]||'Unknown'} | property: ${aaProp(aa)}`;
+      }
+    }
+
+    function updateOutputs(){
+      renderDNA();
+      const mrna = transcribe(dnaSeq);
+      const aa = translate(mrna, frameEl.value, stopEl.value==='true');
+      mrnaOut.textContent = mrna;
+      aaOut.textContent = aa;
+      renderPeptide(aa);
+    }
+    document.getElementById('sample').addEventListener('click', () => {
+      dnaSeq = 'ATGGCCATTGTAATGGGCCGCTGAAAGGGTGCCCGATAG';
+      updateOutputs();
+    });
+
+    // Init
+    init3D();
+  </script>
+</body>
+</html>
